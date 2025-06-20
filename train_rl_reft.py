@@ -23,11 +23,13 @@ import os
 import numpy as np
 import random
 from src.python_engine import run_python_code
-from src.utils import set_seed, floatify, compute_ETA
+from src.utils import set_seed, floatify, compute_ETA, discount_cumsum, do_gather, allgather, allgather_masked_whiten
 from tqdm import tqdm
 import torch
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, AutoModelForCausalLM, get_linear_schedule_with_warmup, AdamW, get_constant_schedule_with_warmup
+from trl import AutoModelForCausalLMWithValueHead
+from trl.core import masked_mean, masked_var, masked_whiten, logprobs_from_logits
 import wandb
 import pandas as pd
 import shutil
@@ -228,9 +230,16 @@ def prepare_datasets_and_data_loaders(args, tokenizer):
 
         tokenized_dataset = DatasetDict({
             mode : dataset.map(
-
+                tokenize_fn,
+                fn_kwargs = {},
+                remove_columns = dataset.column_names,
+                num_proc = None,
+                load_from_cache_file = True,
+                keep_in_memory = False,
             ) for mode, dataset in raw_dataset.items()
         })
+
+        accelerator.print('Processed data:', tokenized_dataset)
 
         if accelerator.is_main_process and args['wandb_log']:
             wandb.config.update({
@@ -245,6 +254,11 @@ def prepare_datasets_and_data_loaders(args, tokenizer):
     
 
     def collate_fn(batch, args, tokenizer):
+        '''
+        作用： 
+            - 如果长度不及 max_input_length, 就对 input_ids 和  attention_mask 进行左填充
+            - 将 input_ids 和 attention_mask 分别转为 Tensor
+        '''
         max_input_length = max([len(item['input_ids']) for item in batch])
         max_target_length = max([len(item['labels']) for item in batch])
         max_prefix_length = max([len(item['prefix']) for item in batch])
@@ -257,19 +271,27 @@ def prepare_datasets_and_data_loaders(args, tokenizer):
         prefix_attention_mask, prefix_attention_mask_left_padded = [], []
 
         for item in batch:
-            pass
+            labels_left_padded.append([-100] * (max_target_length - len(item['labels'])) + item['labels'])
+            prefix_left_padded.append([tokenizer.pad_token_id] * (max_prefix_length - len(item['prefix'])) + item['prefix'])
+            prefix_attention_mask_left_padded.append(
+                [0] * (max_prefix_length - len(item['prefix_attention_mask'])) + item['prefix_attention_mask']
+            )
+
 
 
         ppo_forward_kwargs = {
-
-
-
+            'query': [item['prefix_text'] for item in batch],
+            'query_tensors': torch.LongTensor(prefix_left_padded),
+            'query_tensors_attention_mask': torch.BoolTensor(prefix_attention_mask_left_padded),
+            'answer_value': [item['answer_values'].replace(',', '') for item in batch],
+            'item_ids': [int(item['item_id'].split("_")[1]) for item in batch],
         }
 
 
         generate_prefix_kwargs = {
-
-
+            'input_ids': torch.LongTensor(prefix_left_padded),
+            'attention_mask': torch.BoolTensor(prefix_attention_mask_left_padded),
+            'labels': torch.LongTensor(labels_left_padded)
         }
 
 
@@ -346,7 +368,7 @@ def rollout(args, model, ref_model, tokenizer, query_tensors, query_tensors_atte
         completed_tensors.cpu().numpy().to_list(),
         skip_special_tokens = True,
     )
-    programs = [text.strip().split(cot_trigger)[-1].strip() text for text in completed_texts]
+    programs = [text.strip().split(cot_trigger)[-1].strip() for text in completed_texts]
     execute_fn = post_process_answer_cot_fn_mapper[(args['engine'], src_name)]
     correctness = []  # 用来存放一个 batch 的奖励分数
 
@@ -378,12 +400,16 @@ def rollout(args, model, ref_model, tokenizer, query_tensors, query_tensors_atte
     model_input_ids = completed_tensors
     model_attention_mask = (completed_tensors != tokenizer.pad_token_id)
 
+    value = None
     with torch.no_grad():
         # Get old logprob and val
-        lm_logits, _dummy2, val = model(input_ids=model_input_ids, attention_mask=model_attention_mask)
+        lm_logits, _dummy2, value = model(input_ids=model_input_ids, attention_mask=model_attention_mask)
         old_logprob = logprobs_from_logits(lm_logits[:, -1, :], labels = model_input_ids[:,1:])  # shape = (bs, seqlen-1)
 
-
+        print("*" * 20)
+        print("从策略模型中输出的 value 的形状是:", value.shape)
+        print("*" * 20)
+        
         # Get the ref model logprob
         ref_logprob = None
         if ref_model is not None:
@@ -444,23 +470,32 @@ def rollout(args, model, ref_model, tokenizer, query_tensors, query_tensors_atte
 
 
     # Process value, return, advantage, logprob
-    value = None
+    value = (value.float() * mask).cpu().numpy()  # shape = (bs, seqlen)
     gamma = args['gamma']
     lam = args['lam']
-    advantage = np.zeros_like(reward)
+    advantage = np.zeros_like(reward)  # shape = (bs, seqlen), 但有效值只存在于 (bs, seqlen-1)
 
     for i in range(len(reward)):
-        cur_reward, cur_value = reward[i], value[i]
-        cur_delta = 
-        cur_advantage = 
-        cur_advantage[:prompt_len-1] = 0
+        cur_reward, cur_value = reward[i], value[i] # 取到第 i 条序列的奖励 和 价值
+        # delta = r[t] + gamma * V[t+1] - V[t]
+            # 作用： 获取每一个时间步 t 的 时序差分误差 （TD-Error)
+        cur_delta = cur_reward[:-1] + gamma * cur_value[1:] - cur_value[:-1]  # shape = (seqlen-1,)
+        # 计算每一个时间步 t 的 GAE, shape = (seqlen-1, )
+        cur_advantage = discount_cumsum(cur_delta, discount = gamma*lam)   # 折扣累计和， discount cumulate sum
+        cur_advantage[:prompt_len-1] = 0    #  将 prompt 末尾的 <eos> token 之前的所有位置的 advantage 全部置为 0
         advantage[i][:-1] = cur_advantage
     
 
     # lambda_return = GAE + values
-    ret = advantage + value # (bs, seqlen)
+    ret = advantage + value # (bs, seqlen)    # 回报，用于后续的 token 级别的 MSE loss 计算： L_critic = E_t[value - return] ** 2
+    reward = torch.tensor(reward, device=mask.device, dtype=old_logprob.dtype) * mask
 
+    score_reward  = torch.tensor(score_reward, device=mask.device, dtype=old_logprob.dtype) * mask
 
+    if kl_reward is not None:
+        kl_reward = torch.tensor(kl_reward, device=mask.device, dtype=old_logprob.dtype) * mask
+
+    ret = torch.tensor(ret, device=mask.device, dtype=old_logprob.dtype) * mask
 
     ## Debug
     # accelerator.print("padded_prompt_len:", prompt_len)
@@ -483,7 +518,6 @@ def rollout(args, model, ref_model, tokenizer, query_tensors, query_tensors_atte
 
 
 
-
 def train_one_epoch(args, model, ref_model, train_dataset, train_dataloader, optimizer, scheduler, tokenizer,
                     global_step, global_iter_num, test_dataset, test_dataloader,
                     prefix, epoch, best_eval_log_dict, summary_log_dict, most_recent_ckpts_paths):
@@ -500,7 +534,7 @@ def train_one_epoch(args, model, ref_model, train_dataset, train_dataloader, opt
             result_dict = defaultdict(list)
             # Do rollout first
             model.eval()
-            model_input_ids, model_attention_mask, mask, rew, score_rew, kl_rew, ret, correctness, val, old_logprob, ref_logprob, adv = rollout(
+            model_input_ids, model_attention_mask, mask, reward, score_reward, kl_reward, ret, correctness, value, old_logprob, ref_logprob, advantage = rollout(
                 args, model, ref_model, tokenizer,
                 query_tensors=batch['ppo_forward_kwargs']['query_tensors'],
                 query_tensors_attention_mask=batch['ppo_forward_kwargs']['query_tensors_attention_mask'],
@@ -509,11 +543,11 @@ def train_one_epoch(args, model, ref_model, train_dataset, train_dataloader, opt
             )
             model.train()
             # preprocess
-            raw_adv = adv
+            raward_advantage = advantage
             if args['adv_whitening'] == 'global':
-                adv = allgather_masked_whiten(adv, mask) # (mini_bs, seqlen)
+                advantage = allgather_masked_whiten(advantage, mask) # (mini_bs, seqlen)
             elif args['adv_whitening'] == 'local':
-                adv = masked_whiten(adv, mask)
+                advantage = masked_whiten(advantage, mask)
 
             batch_size_per_gpu = len(batch['ppo_forward_kwargs']['query'])
             mini_batch_size_per_gpu = args["mini_batch_size"]
@@ -522,30 +556,35 @@ def train_one_epoch(args, model, ref_model, train_dataset, train_dataloader, opt
             for _ in range(ppo_epochs):
                 perms = torch.randperm(batch_size_per_gpu)
                 for mini_idx in range(0, len(perms), mini_batch_size_per_gpu):
-                    b_inds = perms[mini_idx: mini_idx + mini_batch_size_per_gpu]
+                    b_inds = perms[mini_idx: mini_idx + mini_batch_size_per_gpu]  # mini batch indexes
                     # Subset to batch
-                    cur_val = val[b_inds].contiguous()  # mini_bs x seqlen
+                    cur_value = value[b_inds].contiguous()  # mini_bs x seqlen       # 取出 一个 minibatch 对应的 value 值
                     cur_old_logprob = old_logprob[b_inds].contiguous()  # mini_bs x seqlen
                     cur_mask = mask[b_inds].contiguous()  # mini_bs x seqlen
-                    cur_rew = rew[b_inds].contiguous()  # mini_bs x seqlen
-                    cur_score_rew = score_rew[b_inds].contiguous() # mini_bs x seqlen
-                    cur_kl_rew = None if kl_rew is None else kl_rew[b_inds].contiguous()  # mini_bs x seqlen
+                    cur_reward = reward[b_inds].contiguous()  # mini_bs x seqlen      # 表示 纯种reward + KL penalty
+                    cur_score_reward = score_reward[b_inds].contiguous() # mini_bs x seqlen   # 表示纯种的reward
+                    cur_kl_reward = None if kl_reward is None else kl_reward[b_inds].contiguous()  # mini_bs x seqlen
                     cur_ret = ret[b_inds].contiguous()  # mini_bs x seqlen
-                    cur_adv = adv[b_inds].contiguous()  # mini_bs x seqlen
-                    cur_raw_adv = raw_adv[b_inds].contiguous()  # mini_bs x seqlen
+                    cur_advantage = advantage[b_inds].contiguous()  # mini_bs x seqlen    # 白化后的优势
+                    cur_raward_advantage = raward_advantage[b_inds].contiguous()  # mini_bs x seqlen  # 白化前的优势
                     cur_model_input_ids = model_input_ids[b_inds].contiguous()  # mini_bs x seqlen
                     cur_model_attention_mask = model_attention_mask[b_inds].contiguous()  # mini_bs x seqlen
                     
                     resp_len_per_sample = torch.clamp(torch.sum(cur_mask, dim=1), min=1.0)  # (mini_bs,)
+                    # 这句代码的含义是：cur_query_mask 表示每个样本中“query”部分的mask。
+                    # cur_mask 通常表示“response”部分的mask，cur_model_attention_mask 表示整个输入（query+response）的mask。
+                    # 两者做异或（logical_xor）后，得到的就是 query 部分为 True，response 部分为 False 的mask，即 cur_query_mask。
                     cur_query_mask = torch.logical_xor(cur_mask, cur_model_attention_mask)  # (mini_bs, seqlen)
                     query_len_per_sample = torch.clamp(torch.sum(cur_query_mask, dim=1), min=1.0)  # (mini_bs,)
 
                     # Preprocess advantage and get metrics  
-                    cur_mask = cur_mask.type(cur_adv.dtype).contiguous()
-                    mean_adv, var_adv = masked_mean(cur_adv, cur_mask), masked_var(cur_adv, cur_mask)
+                    cur_mask = cur_mask.type(cur_advantage.dtype).contiguous()
+                    mean_advantage, var_advantage = masked_mean(cur_advantage, cur_mask), masked_var(cur_advantage, cur_mask)
 
                     # Forward current model
                     model.eval()
+                    # vpreds 表示 value head 输出的每个 token 的 value 预测（即状态价值），
+                    # 用于 PPO 算法中的 value function loss 计算，衡量当前策略下每个 token 的期望回报。
                     lm_logits, _, vpreds = model(input_ids=cur_model_input_ids, attention_mask=cur_model_attention_mask)
                     logprob = logprobs_from_logits(lm_logits[:, :-1, :], cur_model_input_ids[:, 1:])  # (mini_bs, seqlen-1)
 
@@ -554,17 +593,17 @@ def train_one_epoch(args, model, ref_model, train_dataset, train_dataloader, opt
 
                     # policy gradient loss
                     ratio = torch.exp(logprob - cur_old_logprob)
-                    pg_losses = -cur_adv[:, :-1] * ratio
-                    pg_losses2 = -cur_adv[:, :-1] * torch.clamp(ratio, 1.0 - 0.2, 1.0 + 0.2)
-                    pg_loss = ((torch.max(pg_losses, pg_losses2) * cur_mask[:, :-1]).sum(dim=-1) / resp_len_per_sample).mean()
+                    pg_losses = -cur_advantage[:, :-1] * ratio
+                    pg_losses2 = -cur_advantage[:, :-1] * torch.clamp(ratio, 1.0 - 0.2, 1.0 + 0.2)
+                    pg_loss = ((torch.max(pg_losses, pg_losses2) * cur_mask[:, :-1]).sum(dim=-1) / resp_len_per_sample).mean()  # shape = (mini_bs,) -> (1, )
                     # pg_loss = (torch.max(pg_losses, pg_losses2) * cur_mask[:, :-1]).sum() / cur_mask[:, :-1].sum()
                     # pg_loss = (-logprob * cur_ret[:,:-1]).sum() / cur_mask[:, :-1].sum()
 
                     # value loss
-                    vpredclipped = torch.max(torch.min(vpreds, cur_val + 0.2), cur_val - 0.2)
-                    vf_losses1 = (vpreds - cur_ret) ** 2
-                    vf_losses2 = (vpredclipped - cur_ret) ** 2
-                    vf_loss = 0.5 * ((torch.max(vf_losses1, vf_losses2) * cur_mask).sum(dim=-1) / resp_len_per_sample).mean()
+                    vpredclipped = torch.max(torch.min(vpreds, cur_value + 0.2), cur_value - 0.2)
+                    vf_losses1 = (vpreds - cur_ret) ** 2   # shape = (mini_bs, seqlen)
+                    vf_losses2 = (vpredclipped - cur_ret) ** 2  # shape = (mini_bs, seqlen)
+                    vf_loss = 0.5 * ((torch.max(vf_losses1, vf_losses2) * cur_mask).sum(dim=-1) / resp_len_per_sample).mean()  # shape = (mini_bs,) -> (1, )
                     # vf_loss = 0.5 * ((torch.max(vf_losses1, vf_losses2) * cur_mask).sum() / cur_mask.sum())
 
                     # total loss
@@ -592,16 +631,17 @@ def train_one_epoch(args, model, ref_model, train_dataset, train_dataloader, opt
                     # value related metrics
                     # vf_expl_var_num = torch.var(torch.masked_select(cur_ret - vpreds, cur_mask.bool())) 
                     # vf_expl_var_dem = torch.var(torch.masked_select(cur_ret, cur_mask.bool()))
-                    vf_expl_var_num = masked_var(cur_ret - vpreds, cur_mask)
-                    vf_expl_var_dem = masked_var(cur_ret, cur_mask)
-                    vf_expl_var = 1.0 - vf_expl_var_num / (vf_expl_var_dem + 1e-8)
-                    vf_expl_var = max(-1.0, vf_expl_var.item())  # the truncated value suffices
-                    mean_vpred = masked_mean(vpreds, cur_mask)
-                    mean_return = masked_mean(cur_ret, cur_mask)
-                    mean_reward = masked_mean(cur_rew, cur_mask)
-                    mean_score_reward = masked_mean(cur_score_rew, cur_mask)
-                    mean_kl_reward = 0.0 if cur_kl_rew is None else masked_mean(cur_kl_rew, cur_mask)
-                    mean_kcxkl_reward = args["kl_coef"] * mean_kl_reward
+                    # 下面这些参数用于记录 PPO 训练过程中的 value 相关统计量
+                    vf_expl_var_num = masked_var(cur_ret - vpreds, cur_mask)  # 解释方差（value function explanation variance）的分子，cur_ret - vpreds 的掩码方差（预测误差的方差）
+                    vf_expl_var_dem = masked_var(cur_ret, cur_mask)            # 解释方差的分母，cur_ret 的掩码方差（真实回报的方差）
+                    vf_expl_var = 1.0 - vf_expl_var_num / (vf_expl_var_dem + 1e-8)  # value function 的解释方差（explained variance），衡量 value 预测能力
+                    vf_expl_var = max(-1.0, vf_expl_var.item())  # 解释方差下限截断为 -1.0，防止数值异常
+                    mean_vpred = masked_mean(vpreds, cur_mask)   # 预测 value 的掩码均值
+                    mean_return = masked_mean(cur_ret, cur_mask) # 真实回报的掩码均值
+                    mean_reward = masked_mean(cur_reward, cur_mask) # 总奖励的掩码均值       # 表示纯种 reward + KL penalty
+                    mean_score_reward = masked_mean(cur_score_reward, cur_mask) # 任务得分奖励的掩码均值     # 表示纯种 reward
+                    mean_kl_reward = 0.0 if cur_kl_reward is None else masked_mean(cur_kl_reward, cur_mask) # KL 奖励的掩码均值（如果有 KL 奖励）
+                    mean_kcxkl_reward = args["kl_coef"] * mean_kl_reward # KL 奖励乘以系数后的均值
 
                     # policy related metrics
                     mean_ratio = masked_mean(ratio, cur_mask[:, :-1])
@@ -609,8 +649,8 @@ def train_one_epoch(args, model, ref_model, train_dataset, train_dataloader, opt
                     mean_logprob = masked_mean(logprob, cur_mask[:, :-1])
                     # sequence-level kl
                     mean_seq_kl = -1.0
-                    if cur_kl_rew is not None:
-                        cur_kl = -cur_kl_rew
+                    if cur_kl_reward is not None:
+                        cur_kl = -cur_kl_reward
                         seq_kl = torch.sum(cur_kl * cur_mask, dim=1)  # (mini_bs,)
                         mean_seq_kl = torch.mean(seq_kl)
 
@@ -620,15 +660,21 @@ def train_one_epoch(args, model, ref_model, train_dataset, train_dataloader, opt
                     # accelerator.backward(loss)
                     # accelerator.deepspeed_engine_wrapped.backward(loss)
                     # runs backpropagation and handles mixed precision
+                    # 下面这段代码用于根据分布式训练的类型（如是否使用Deepspeed）来执行反向传播、梯度归一化、参数更新等操作
                     if accelerator.distributed_type == "DEEPSPEED":
+                        # 如果使用Deepspeed分布式训练，则通过Deepspeed的engine进行反向传播
                         accelerator.deepspeed_engine_wrapped.engine.backward(loss)
                         total_grad_norm = 0.0
+                        # 遍历模型的所有参数，计算每个参数的梯度L2范数，并累加得到总的梯度范数
                         for n, p in model.named_parameters():
+                            # deepspeed.utils.safe_get_full_grad(p) 获取完整的梯度（可能跨张量分片）
                             cur_grad = deepspeed.utils.safe_get_full_grad(p).view(-1)
-                            cur_grad_norm_sqrt = torch.norm(cur_grad, 2)
+                            cur_grad_norm_sqrt = torch.norm(cur_grad, 2)  # 这里计算的是当前参数的梯度的 L2 范数（即欧几里得范数），等价于 sqrt(sum(grad_i^2))，其中 grad_i 是该参数所有元素的梯度
+                            # 如果某个参数的梯度范数非常小，打印出来用于调试
                             if cur_grad_norm_sqrt < 1e-8:
                                 accelerator.print(f'{n} grad_norm_sqrt: {cur_grad_norm_sqrt}')
                             total_grad_norm += cur_grad_norm_sqrt ** 2
+                        # 计算总的L2范数
                         total_grad_norm = total_grad_norm ** 0.5
                         # Deepspeed's `engine.step` performs the following operations:
                         # - gradient accumulation check
@@ -639,12 +685,15 @@ def train_one_epoch(args, model, ref_model, train_dataset, train_dataloader, opt
                         # - lr_scheduler step (only if engine.lr_scheduler is not None)
                         accelerator.deepspeed_engine_wrapped.engine.step()
                     else:
+                        # 如果不是Deepspeed分布式，则用accelerator的通用反向传播接口
                         accelerator.backward(loss)
                         #accelerator.backward(loss)
                         total_grad_norm = -1.0
+                        # 如果设置了clip_grad_norm，则对梯度进行裁剪，并返回裁剪后的总梯度范数
                         if clip_grad_norm is not None:
                             total_grad_norm = accelerator.clip_grad_norm_(model.parameters(), clip_grad_norm)
                     optimizer.step()
+                    # 清空模型和优化器的梯度
                     model.zero_grad()
                     optimizer.zero_grad()
 
@@ -660,7 +709,7 @@ def train_one_epoch(args, model, ref_model, train_dataset, train_dataloader, opt
                     for k, v in train_stats.items():
                         result_dict[k].append(v)
 
-                    total_param_norm = 0.0
+                    total_param_norm = 0.0  # 用于记录当前模型参数的L2范数
                     if accelerator.distributed_type == "DEEPSPEED":
                         for n, p in model.named_parameters():
                             cur_param = deepspeed.utils.safe_get_full_fp32_param(p).view(-1)
@@ -674,34 +723,61 @@ def train_one_epoch(args, model, ref_model, train_dataset, train_dataloader, opt
                     # logging
                     if accelerator.is_main_process and args['wandb_log']:
                         wandb.log({
+                            # nn/total_grad_norm: 当前所有梯度的L2范数（用于监控梯度爆炸/消失）
+                            # nn/total_param_norm: 当前所有模型参数的L2范数（用于监控参数规模）
+                            # nn/lr: 当前学习率
                             "nn/total_grad_norm": total_grad_norm,
                             "nn/total_param_norm": total_param_norm,
                             "nn/lr": scheduler.get_last_lr()[0],
                         }, step=global_iter_num)
                         wandb.log({
+                            # acc/acc: 当前batch的准确率
+                            # acc/ncor: 当前batch中预测正确的样本数
+                            # acc/total: 当前batch的总样本数
                             "acc/acc": train_stats["acc"],
                             "acc/ncor": train_stats["ncor"],
                             "acc/total": train_stats["total"],
                         }, step=global_iter_num)
+
                         wandb.log({
+                            # loss/loss:: 总损失（policy loss + value loss等）
+                            # loss/pg_loss: policy gradient损失
+                            # loss/vf_loss: value function损失
                             "loss/loss:": loss,
                             "loss/pg_loss": pg_loss,
                             "loss/vf_loss": vf_loss,
                         }, step=global_iter_num)
+
                         wandb.log({
+                            # tokens/mean_query_len: 输入query的平均长度
+                            # tokens/std_query_len: 输入query长度的标准差
+                            # tokens/mean_resp_len: 输出response的平均长度
+                            # tokens/std_resp_len: 输出response长度的标准差
                             "tokens/mean_query_len": mean_query_len,
                             "tokens/std_query_len": std_query_len,
                             "tokens/mean_resp_len": mean_resp_len,
                             "tokens/std_resp_len": std_resp_len,
                         }, step=global_iter_num)
                         wandb.log({
+                            # policy/mean_ratio: 策略概率比均值（新旧策略概率比，PPO常用）
+                            # policy/mean_adv: 优势函数均值
+                            # policy/var_adv: 优势函数方差
+                            # policy/mean_logprob: 动作对数概率均值
+                            # policy/mean_seq_kl: 序列级KL散度均值（新旧策略分布的KL）
                             "policy/mean_ratio": mean_ratio,
-                            "policy/mean_adv": mean_adv,
-                            "policy/var_adv": var_adv,
+                            "policy/mean_adv": mean_advantage,
+                            "policy/var_adv": var_advantage,
                             "policy/mean_logprob": mean_logprob,
                             "policy/mean_seq_kl": mean_seq_kl,
                         }, step=global_iter_num)
                         wandb.log({
+                            # value/vf_expl_var: value function的解释方差（衡量value预测的好坏）
+                            # value/mean_vpred: value预测均值
+                            # value/mean_return: 回报均值
+                            # value/mean_reward: 奖励+KL惩罚 的均值
+                            # value/mean_score_reward: 奖励均值
+                            # value/mean_kl_reward: KL奖励均值
+                            # value/mean_kcxkl_reward: kcxkl奖励均值（多乘了一项 KL coefficient）
                             "value/vf_expl_var": vf_expl_var,
                             "value/mean_vpred": mean_vpred,
                             "value/mean_return": mean_return,
@@ -712,15 +788,15 @@ def train_one_epoch(args, model, ref_model, train_dataset, train_dataloader, opt
                         }, step=global_iter_num)
                     # Update iter num
                     # torch.distributed.barrier()
-                    global_iter_num += 1
+                    global_iter_num += 1    # 记录 mini-batch 的全局数量
 
-            scheduler.step()
-            global_step += 1
+            scheduler.step()    # 每个 batch 结束时，更新学习率
+            global_step += 1    # 记录 batch 的全局数量
             # accelerator.empty_cache()
             # Step update metric
             epoch_result_dict['loss'].append(loss.item())
             for k, v in train_stats.items():
-                epoch_result_dict[k].append(v)
+                epoch_result_dict[k].append(v)   
 
             # Step evaluating
             eval_log_dict = {}
@@ -733,7 +809,7 @@ def train_one_epoch(args, model, ref_model, train_dataset, train_dataloader, opt
                     is_best = True
                     best_eval_log_dict['Eval.Gen.value_accuracy_best'] = eval_log_dict['Eval.Gen.value_accuracy']
                     if 'Eval.Gen.value_accuracy' not in summary_log_dict:
-                        summary_log_dict['Eval.Gen.value_accuracy'] = []
+                        summary_log_dict['Eval.Gen.value_accuracy'] = []  # log the history of the best score
                     summary_log_dict['Eval.Gen.value_accuracy'].append(eval_log_dict['Eval.Gen.value_accuracy'])
 
             # Step logging

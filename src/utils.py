@@ -107,6 +107,93 @@ def allgather(tensor, group=None):
 
 
 
+from trl.core import masked_mean, masked_var
+def allgather_masked_whiten(values, mask, shift_mean=False):
+    """Whiten values with all-gathered masked values.
+
+    Args:
+        values: (bs, ...)
+        mask: (bs, ...)
+        shift_mean: bool
+
+    Returns:
+        whitened values, (bs, ...)
+    """
+
+    allgather_values = allgather(values)  # shape = (world_size, bs, seqlen)
+
+    # accelerator.print(f'allgather_values {allgather_values.shape}, {allgather_values[0, 0:3]}')
+
+    allgather_mask  =allgather(mask)  # shape = (world_size, bs, seqlen)
+    # accelerator.print(f'allgather_mask {allgather_mask.shape}, {allgather_mask[0, 0:3]}')
+
+    global_mean = masked_mean(allgather_values, allgather_mask)
+    global_var = masked_var(allgather_values, allgather_mask)
+
+    whitened = (values - global_mean) * torch.rsqrt(global_var + 1e-8) # 作用， 将 values 白化， 使得白化后的 values 的均值为 0， 方差为 1， 将 values 的范围限制在 [-1, 1] 之间
+
+    if shift_mean:
+        whitened += global_mean
+    return whitened  # shape = (bs, seqlen)
+
+
+import scipy.signal as scipy_signal
+def discount_cumsum(rewards, discount):
+    """
+    计算折扣累计和（discounted cumulative sum）。
+
+    该函数常用于强化学习中，用于计算奖励序列的折扣累计和（如 GAE、回报等）。
+    给定奖励序列 rewards = [r0, r1, r2, ..., rN] 和折扣因子 discount，
+    输出为 [r0 + discount*r1 + discount^2*r2 + ...,
+           r1 + discount*r2 + ...,
+           ...,
+           rN]
+
+    工作流程如下：
+    1. rewards[::-1]：将奖励序列反转，便于从后往前递推累计和。
+    2. scipy_signal.lfilter([1], [1, -discount], x)：使用线性滤波器高效实现递推公式。
+       - 该滤波器实现了 y[n] = x[n] + discount * y[n-1]，即 y[n] = rewards[n] + discount * y[n+1] 的反向递推。
+    3. 最后再[::-1]反转回来，得到正序的折扣累计和。
+
+
+    # 举例：
+    
+    - 原始奖励为： 
+    [r1, r2, r3,..., r_{N-1}, r_N]
+
+    - 反转后的奖励为：
+    [r_N, r_{N-1}, ..., r_3, r_2, r_1]
+
+    - 使用 lfilter 计算折扣累计和：
+    R_N = r_N + discount * 0     # 注，第 N+1 步的奖励为 0， 这应该已经包含在 reward 矩阵中了， 
+                                    # reward 矩阵初始时为全 0，  初始时的 reward.shape = (bs, seqlen)
+                                    # 但由于最后一步的奖励无意义，我们 只填充 reward[:, :-1]
+
+    R_{N-1} = r_{N-1} + discount * R_N
+
+    R_{N-2} = r_{N-2} + discount * R_{N-1}
+
+    ...
+
+    R_1 = r_1 + discount * R_2 = r1 + discount * (r2 + discount * (r3 + discount * ...))
+
+    - 最后再反转回来，得到正序的折扣累计和：
+    [R_1, R_2, ..., R_{N-1}, R_N]
+
+
+    Args:
+        rewards (np.ndarray or list): 奖励序列
+        discount (float): 折扣因子
+
+    Returns:
+        np.ndarray: 折扣累计和序列
+    """
+    # 先将奖励序列反转，便于从后往前递推
+    # 使用lfilter高效计算折扣累计和
+    # 最后再反转回来，得到正序结果
+    return scipy_signal.lfilter([1], [1, -discount], x=rewards[::-1])[::-1]
+
+
 
 
 from datetime import timedelta

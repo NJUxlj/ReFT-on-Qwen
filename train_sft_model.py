@@ -120,10 +120,6 @@ def do_checkpoint(args, model, tokenizer, save_path, most_recent_ckpts_paths=Non
 
 
 
-
-
-
-
 def evaluatte_generation(
     args,
     model,
