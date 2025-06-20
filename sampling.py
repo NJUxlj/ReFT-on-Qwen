@@ -90,12 +90,39 @@ def tokenize_fn(examples:Dict, tokenizer, max_length, src_name, engine):
 
     return features
 
-def collate_fn():
-    pass
+def collate_fn(features, tokenizer):
+    '''
+    将 input_ids, attention_mask 先 padding， 随后转为 tensor
+
+    return:
+        Dict[str, Tensor]
+    
+    '''
+    batch = {"input_ids": [], "attention_mask": []}
+
+
+
+    batch["input_ids"] = torch.tensor(batch["input_ids"])
+    batch["attention_mask"] = torch.tensor(batch["attention_mask"])
+
+    return batch
 
 
 def main(args):
-    pass
+    set_seed(42)
+    if torch.distributed.get_rank() == 0 and args['wandb_log']:
+        wandb.init(project=args['wandb_project'], name=args['wandb_run_name'])
+        wandb.config.update(args)
+    # Init parameter
+    model_name = args['model_name'] 
+    input_path = args['input_path']
+    save_dir = args['save_dir']
+    engine = args['engine']
+    batch_size = args['batch_size']
+    max_length = args['max_length']
+    num_return_sequences = args['num_return_sequences']
+    temperature = args['temperature']
+    do_sample = args['do_sample']
 
 
 
