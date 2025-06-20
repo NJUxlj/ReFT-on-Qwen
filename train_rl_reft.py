@@ -521,6 +521,18 @@ def rollout(args, model, ref_model, tokenizer, query_tensors, query_tensors_atte
 def train_one_epoch(args, model, ref_model, train_dataset, train_dataloader, optimizer, scheduler, tokenizer,
                     global_step, global_iter_num, test_dataset, test_dataloader,
                     prefix, epoch, best_eval_log_dict, summary_log_dict, most_recent_ckpts_paths):
+    '''
+    训练一个 epoch 的模型
+    
+    Args:
+        args: 配置参数
+        model: 模型
+        ref_model: 参考模型
+        train_dataset: 训练数据集
+        train_dataloader: 训练数据加载器
+        global_step: 全局 batch 数量
+        global_iter_num: 全局 mini-batch 数量
+    '''
     model_dir = args['model_dir']
     clip_grad_norm = args.get('clip_grad_norm', None)
     vf_coef = args['vf_coef']
@@ -823,7 +835,7 @@ def train_one_epoch(args, model, ref_model, train_dataset, train_dataloader, opt
                     wandb.log(log_dict, step=global_step)
                     log_dict = {'wandb': args['wandb_project'] + '|' + args['wandb_run_name'], **log_dict}
                 log_dict = {k: f'{v:.5g}' if isinstance(v, float) else v for k,v in log_dict.items()}
-                accelerator.print(f"{prefix}[E={epoch}/{args['n_epochs']}, S={global_step}] {log_dict}")
+                accelerator.print(f"{prefix}[Epoch={epoch}/{args['n_epochs']}, Step(global)={global_step}] \n{json.dumps(log_dict, indent=4)}")
 
             # Step saving
             if saving_step_freq is not None and global_step % saving_step_freq == 0:
